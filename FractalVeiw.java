@@ -3,8 +3,8 @@ package com.johnsonandschraft.h0x0.fractalviewer;
 import android.annotation.TargetApi;
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
@@ -14,7 +14,6 @@ import android.os.Build;
 import android.os.Parcelable;
 import android.support.annotation.NonNull;
 import android.util.AttributeSet;
-import android.util.Log;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -22,8 +21,8 @@ import android.view.View;
 import android.view.animation.AccelerateDecelerateInterpolator;
 import android.widget.OverScroller;
 
-import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Hashtable;
 import java.util.List;
 
 /**
@@ -34,22 +33,28 @@ public class FractalView extends View{
     @SuppressWarnings("UnusedDeclaration")
     private static final String DEBUG_TAG = "FractalView";
 
-    private Matrix overall, cur;
+    private Matrix overall, cur, temp;
     private float[] mValues = new float[9];
     private RectF bounds, content;
-    private int minX, minY, maxX, maxY;
 
-    private Paint pallet;
-    private int[] colors;
+    private Paint paint;
+    private int[] colors, histogram, pallet;
+    private Hashtable<Integer, Integer> colorMap;
     private FractalSet set = new MandelbrotSet();
 
-    private List<Region> regions;
+    private List<FractalRegion> regions;
+    private RegionAnimator regionAnimator;
 
     private GestureDetector gestureDetector;
     private ScaleGestureDetector scaleGestureDetector;
+    private boolean showPos = false;
+    private static final String POS_TEXT = "Position: (%f,%f), Zoom: %f";
+    private Paint posPaint;
+    private Rect posRect;
 
     public interface FractalSet {
         int calculate(float x, float y);
+        int maxVal();
     }
 
     protected GestureDetector.OnGestureListener gestureListener
@@ -57,12 +62,14 @@ public class FractalView extends View{
         private FlingAnimation flingAnimation;
         @Override
         public boolean onDown(MotionEvent e) {
+            if (flingAnimation != null) flingAnimation.cancel();
+            regionAnimator.cancel();
             return false;
         }
 
         @Override
         public void onShowPress(MotionEvent e) {
-
+            showPos = true;
         }
 
         @Override
@@ -73,7 +80,7 @@ public class FractalView extends View{
         @Override
         public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
             cur.postTranslate(-distanceX, -distanceY);
-            clampTranslate();
+            _clamp();
             FractalView.this.invalidate();
             return false;
         }
@@ -96,12 +103,9 @@ public class FractalView extends View{
         private float scaleBefore;
         @Override
         public boolean onScale(ScaleGestureDetector detector) {
-            float postScale = detector.getScaleFactor() / scaleBefore;
+            float postScale = 1.0f + (detector.getScaleFactor() - scaleBefore);
             cur.postScale(postScale, postScale, detector.getFocusX(), detector.getFocusY());
-            cur.getValues(mValues);
-            float scaleAfter = mValues[Matrix.MSCALE_X];
-            Log.d(DEBUG_TAG, String.format("Scale before %f - Post Scale %f - Scale after %f", scaleBefore, postScale, scaleAfter));
-            scaleBefore = scaleAfter;
+            scaleBefore = detector.getScaleFactor();
             FractalView.this.invalidate();
             return false;
         }
@@ -109,13 +113,13 @@ public class FractalView extends View{
         @Override
         public boolean onScaleBegin(ScaleGestureDetector detector) {
             cur.getValues(mValues);
-            scaleBefore = mValues[Matrix.MSCALE_X];
+            scaleBefore = detector.getScaleFactor();
             return true;
         }
 
         @Override
         public void onScaleEnd(ScaleGestureDetector detector) {
-
+            _updateContent();
         }
     };
 
@@ -131,21 +135,31 @@ public class FractalView extends View{
             final int vX = (int) velocityX;
             final int vY = (int) velocityY;
 
+            RectF dst = new RectF(content);
+            _clamp(dst);
+
+            final int localMinX = (int) (dst.left - bounds.left);
+            final int localMaxX = (int) (dst.right - bounds.right);
+            final int localMinY = (int) (dst.top - bounds.bottom);
+            final int localMaxY = (int) (dst.bottom - bounds.bottom);
+
             scroller = new OverScroller(getContext(), new AccelerateDecelerateInterpolator());
-            scroller.fling(curX, curY, vX, vY, minX, maxX, minY, maxY);
+
+            scroller.fling(curX, curY, vX, vY, localMinX, localMaxX, localMinY, localMaxY);
         }
 
         @Override
         public void run() {
             if (scroller.isFinished()) {
                 scroller = null;
+                _updateContent();
             } else if (scroller.computeScrollOffset()) {
                 final int dx = scroller.getCurrX() - curX;
                 final int dy = scroller.getCurrY() - curY;
                 cur.postTranslate(dx, dy);
-                curX = scroller.getCurrX();
-                curY = scroller.getCurrY();
-
+                curX += dx;
+                curY += dy;
+                _clamp();
                 FractalView.this.invalidate();
                 compatPostOnAnimation(this);
             }
@@ -156,108 +170,262 @@ public class FractalView extends View{
         }
     }
 
-    private class AnimateResolve implements Runnable {
-        private Region region;
-
-        public AnimateResolve(Region region) {
-            this.region = region;
-        }
-
-        @Override
-        public void run() {
-            region.resolve();
-            FractalView.this.invalidate();
-        }
+    private void _updateContent() {
+        cur.invert(temp);
+        temp.postConcat(overall);
+        overall.set(temp);
+        cur.reset();
+        for (FractalRegion region : regions) region.setDecimation(START_DECIMATION);
     }
 
     private static final int START_DECIMATION = 3;
-    private static final int MIN_DECIMATION = 0;
-    private class Region {
-        private Bitmap bitmap;
-        private Matrix matrix;
-        private RectF regionBounds;
-        private int decimation;
+    private static final int MIN_DECIMATION = 1;
 
-        public Region(RectF regionBounds) {
-            this.regionBounds = regionBounds;
-            matrix = new Matrix();
-            matrix.setTranslate(regionBounds.left, regionBounds.top);
-            decimation = START_DECIMATION + 1;
+    private class FractalRegion {
+        private Bitmap bitmap;
+        private RectF bounds;
+        private int offset, stride, decimation, calcWidth, calcHeight;
+        private boolean rendered;
+        private RegionCalculateTask task;
+
+        public FractalRegion(RectF bounds) {
+            this.bounds = bounds;
+            stride = ((int) content.width()) >> MIN_DECIMATION;
+            offset = stride * (((int) (bounds.top - content.top)) >> MIN_DECIMATION)
+                    + (((int) (bounds.left - content.left)) >> MIN_DECIMATION);
+            decimation = 0;
         }
 
+        public void cancel() {
+            if (task != null) task.cancel(true);
+        }
 
-        public void resolve() {
-            if (decimation > MIN_DECIMATION) {
-                final RegionResolver resolver = new RegionResolver(this);
-                resolver.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, --decimation);
-            }
+        public void setDecimation(int decimation) {
+            if (task != null) task.cancel(true);
+
+            this.decimation = decimation;
+            calcWidth = ((int) bounds.width()) >> decimation;
+            calcWidth = calcWidth > 0 ? calcWidth : 1;
+            calcHeight = ((int) bounds.height()) >> decimation;
+            calcHeight = calcHeight > 0 ? calcHeight : 1;
+
+            rendered = false;
+            task = new RegionCalculateTask(this);
+            task.execute();
+        }
+
+        public void setDecimation() {
+            setDecimation(--decimation);
+        }
+
+        public void setBitmap(Bitmap bitmap) {
+            this.bitmap = bitmap;
+            rendered = true;
+            task = null;
         }
 
         public Bitmap getBitmap() {
             return bitmap;
         }
 
-        public void setBitmap(Bitmap bitmap) {
-            this.bitmap = bitmap;
-            matrix.setScale(
-                    regionBounds.width() / bitmap.getWidth(),
-                    regionBounds.height() / bitmap.getHeight()
-            );
-            matrix.postTranslate(regionBounds.left, regionBounds.top);
+        public RectF getBounds() {
+            return bounds;
         }
 
-        public Matrix getMatrix() {
-            return matrix;
+
+        public boolean isRendered() {
+            return rendered;
         }
 
-        public RectF getRegionBounds() {
-            return regionBounds;
+        public int getOffset() {
+            return offset;
+        }
+
+        public int getStride() {
+            return stride;
+        }
+
+        public int getCalcWidth() {
+            return calcWidth;
+        }
+
+        public int getCalcHeight() {
+            return calcHeight;
+        }
+
+        public int getDecimation() {
+            return decimation;
         }
     }
 
-    private class RegionResolver extends AsyncTask<Integer, Void, Bitmap> {
-        private WeakReference<Region> regionWeakReference;
-        private Rect regionRect;
-        private float[] tmpPoint = new float[2];
-        private int offset, stride;
+    private class RegionAnimator implements Runnable {
+        private RegionBitmapTask task;
 
-        public RegionResolver(Region region) {
-            regionWeakReference = new WeakReference<>(region);
-            regionRect = new Rect();
-            region.getRegionBounds().round(regionRect);
-            offset = (int) content.width() * (regionRect.top - (int) content.top)
-                    + (regionRect.left - (int) content.left);
-            stride = (int) content.width();
+        @Override
+        public void run() {
+            boolean renderComplete = true;
+            for (FractalRegion region : regions) {
+                if (!region.isRendered()) {
+                    renderComplete = false;
+                    continue;
+                }
+
+                if (region.getDecimation() > MIN_DECIMATION) {
+                    region.setDecimation();
+                    renderComplete = false;
+                }
+            }
+
+            if (renderComplete) {
+                task = new RegionBitmapTask();
+                task.execute();
+            }
+            FractalView.this.invalidate();
+        }
+
+        public void cancel() {
+            if (task != null) task.cancel(true);
+            for (FractalRegion region : regions) region.cancel();
+        }
+    }
+
+    private class RegionCalculateTask extends AsyncTask<Void, Integer, Void> {
+        private FractalRegion region;
+
+        public RegionCalculateTask(FractalRegion region) {
+            this.region = region;
         }
 
         @Override
-        protected void onPostExecute(Bitmap bitmap) {
-            Region region = regionWeakReference.get();
-            if (region == null) return;
-
-            region.setBitmap(bitmap);
-            compatPostOnAnimation(new AnimateResolve(region));
+        protected void onPostExecute(Void aVoid) {
+            compatPostOnAnimation(regionAnimator);
         }
 
         @Override
-        protected Bitmap doInBackground(Integer... params) {
-            final int dec = params[0];
-            final int w = regionRect.width() >> dec < 1 ? 1 : regionRect.width() >> dec;
-            final int h = regionRect.height() >> dec < 1 ? 1 : regionRect.height() >> dec;
+        protected Void doInBackground(Void... params) {
+            int value, index;
+            float[] point = new float[2];
+
+            final int offset = region.getOffset();
+            final int stride = region.getStride();
+            final int w = region.getCalcWidth();
+            final int h = region.getCalcHeight();
+            final float left = region.getBounds().left;
+            final float top = region.getBounds().top;
+            final float hStep = region.getBounds().width() / w;
+            final float vStep = region.getBounds().height() / h;
+
             for (int i = 0; i < h; i++) {
                 if (isCancelled()) break;
                 for (int j = 0; j < w; j++) {
                     if (isCancelled()) break;
-                    tmpPoint[0] = regionRect.left + j * regionRect.width() / w;
-                    tmpPoint[1] = regionRect.top + i * regionRect.height() / h;
-                    overall.mapPoints(tmpPoint);
+                    point[0] = left + j * hStep;
+                    point[1] = top + i * vStep;
+                    overall.mapPoints(point);
+
+                    index = offset + stride * i + j;
+                    value = set.calculate(point[0], point[1]);
+
                     synchronized (this) {
-                        colors[offset + stride * i + j] =
-                                set.calculate(tmpPoint[0], tmpPoint[1]);
+                        int color = colors[value];
+                        int iteration;
+                        if (colorMap.containsKey(color)) {
+                            iteration = colorMap.get(color);
+                            if (histogram[iteration] > 0) histogram[iteration]--;
+                        }
+                        histogram[value]++;
+
+                        colors[index] = pallet[value];
                     }
                 }
             }
-            return Bitmap.createBitmap(colors, offset, stride, w, h, Bitmap.Config.RGB_565);
+
+            synchronized (this) {
+                region.setBitmap(Bitmap.createBitmap(colors, offset, stride, w, h,
+                        Bitmap.Config.RGB_565));
+            }
+
+//            regionAnimator.enqueueRegion(region);
+            return null;
+        }
+    }
+
+    private class RegionBitmapTask extends AsyncTask<Void, Void, Void> {
+
+        @Override
+        protected Void doInBackground(Void... params) {
+
+            float total = 0.0f;
+            for (int n : histogram) total += n;
+
+            synchronized (this) {
+                colorMap.clear();
+                for (int i = 0; i < pallet.length; i++) {
+                    float k = 0.0f;
+                    for (int j = 0; j <= i; j++) {
+                        k += histogram[j];
+                    }
+
+                    float r = k / total;
+                    float hue = (600.0f - (r * 260.0f)) % 360.0f;
+                    float sat = 1.0f - _saturationKnockOut(r);
+                    float val = 1.0f - _valueKnockOut(r);
+
+//                    recolor[i] = pallet[i];
+                    int color = Color.HSVToColor(new float[]{hue, sat, val});
+                    colorMap.put(pallet[i], i);
+                    pallet[i] = color;
+                }
+            }
+
+            synchronized (this) {
+                for (int i = 0 ; i < colors.length; i++) {
+                    if (isCancelled()) return null;
+
+                    if (!colorMap.containsKey(colors[i])) continue;
+                    colors[i] = pallet[colorMap.get(colors[i])];
+                }
+            }
+
+            if (isCancelled()) return null;
+            synchronized (this) {
+                for (FractalRegion region : regions) {
+                    int offset = region.getOffset();
+                    int stride = region.getStride();
+                    int w = region.getCalcWidth();
+                    int h = region.getCalcHeight();
+
+                if (region.bounds.contains(bounds.centerX() - 1.0f, bounds.bottom)) {
+                    region.setBitmap(Bitmap.createBitmap(pallet, pallet.length >> 5, 32, Bitmap.Config.RGB_565));
+                } else if(region.bounds.contains(bounds.centerX(), bounds.bottom)) {
+                    region.setBitmap(Bitmap.createBitmap(histogram, histogram.length >> 5, 32, Bitmap.Config.RGB_565));
+                }else  {
+                        region.setBitmap(Bitmap.createBitmap(colors, offset, stride, w, h,
+                                Bitmap.Config.RGB_565));
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        @Override
+        protected void onPostExecute(Void aVoid) {
+            compatPostOnAnimation(regionAnimator);
+        }
+
+        private float _saturationKnockOut(float r) {
+            final double sigma = 0.0875, mu = 1.0 / 6.0;
+            final double sqrt2Pi = Math.sqrt(2.0 * Math.PI);
+            double k = Math.exp(-1.0 * (((r - mu) * (r - mu)) / (2.0 * sigma * sigma))) /
+                    (sigma * sqrt2Pi);
+            return ((float) (k * 0.1));
+        }
+
+        private float _valueKnockOut(float r) {
+            final double alpha = 12, beta = 0.45;
+            float k = ((float) (beta * Math.exp(-alpha * r)));
+            return r == 1 ? 1f : 0f;
         }
     }
 
@@ -275,12 +443,36 @@ public class FractalView extends View{
         gestureDetector = new GestureDetector(getContext(), gestureListener);
         scaleGestureDetector = new ScaleGestureDetector(getContext(), scaleGestureListener);
 
-        pallet = new Paint();
-//        pallet.setAntiAlias(true);
+        paint = new Paint();
+        paint.setAntiAlias(true);
         cur = new Matrix();
-//        regions = new ArrayList<>();
-    }
 
+        histogram = new int[set.maxVal() + 1];
+        pallet = new int[set.maxVal() + 1];
+        colorMap = new Hashtable<>(set.maxVal() + 1);
+
+        double alpha = 200.0, beta = 0.75, alpha2 = 15.0;
+
+        for (int i = 0; i < pallet.length; i++) {
+            float f = ((float) i) / ((float) set.maxVal());
+            float exp = 1.0f - ((float) Math.exp(-alpha2 * f));
+            pallet[i] = Color.HSVToColor(new float[] {
+                    (600.0f - (exp * 260.0f)) % 360.0f,
+                    ((float) Math.cos(f * Math.PI / 2.0)),
+                    i == pallet.length - 1 ? 0 :
+                            ((float) (beta + (1 - beta) * (1.0 - Math.exp(-alpha * f))))
+            });
+            colorMap.put(pallet[i], i);
+        }
+
+        temp = new Matrix();
+        posPaint = new Paint();
+        posPaint.setColor(Color.WHITE);
+        posPaint.setAntiAlias(true);
+        posPaint.setTextAlign(Paint.Align.LEFT);
+        posPaint.setTextSize(20f);
+        posRect = new Rect();
+    }
 
     private static final int DIVISIONS = 6;
     private static final float EXCESS = 0.3f;
@@ -297,41 +489,35 @@ public class FractalView extends View{
         );
         final int k = (int) content.width();
         final int l = (int) content.height();
-        colors = new int[k * l];
-
-        minX = (int) (content.left - bounds.left);
-        maxX = (int) (content.right - bounds.right);
-        minY = (int) (content.top - bounds.top);
-        maxY = (int) (content.bottom - bounds.bottom);
+        colors = new int[(k * l) >> MIN_DECIMATION];
 
         overall = new Matrix();
         final float sX = 3.5f / w;
         final float sY = 2f / h;
-        overall.setTranslate(-w / 2, -h / 2);
+        overall.postTranslate(-w / 2, -h / 2);
         overall.postScale(sY < sX ? sX : sY, sY < sX ? sX : sY);
+        overall.postTranslate(-0.25f, 0);
 
         regions = new ArrayList<>();
-        Region tmp;
+        FractalRegion temp;
         float dx = content.width() / DIVISIONS;
         float dy = content.height() / DIVISIONS;
+        regionAnimator = new RegionAnimator();
+
         for (int i = 0; i < DIVISIONS; i++) {
             for (int j = 0; j < DIVISIONS; j++) {
-                tmp = new Region(
-                        new RectF(
-                                content.left + j * dx,
-                                content.top + i * dy,
-                                content.left + (j + 1) * dx,
-                                content.top + (i + 1) * dy
-                        )
-                );
-//                tmp = new Region(new RectF( i * dx, j * dy, (i + 1) * dx, (j + 1) * dy));
-                tmp.setBitmap(BitmapFactory.decodeResource(getResources(), R.drawable.hourglass));
-//                tmp.resolve();
-                regions.add(tmp);
+                temp = new FractalRegion(new RectF(
+                        content.left + j * dx,
+                        content.top + i * dy,
+                        content.left + (j + 1) * dx,
+                        content.top + (i + 1) * dy
+                ));
+                temp.setBitmap(Bitmap.createBitmap(pallet, pallet.length >> 5, 32,
+                        Bitmap.Config.RGB_565));
+                regions.add(temp);
+                temp.setDecimation(START_DECIMATION);
             }
         }
-
-        for (Region region : regions) region.resolve();
     }
 
     @Override
@@ -345,14 +531,27 @@ public class FractalView extends View{
 
         canvas.save();
         canvas.concat(cur);
-        for (Region region : regions) {
-            canvas.drawBitmap(region.getBitmap(), region.getMatrix(), pallet);
+        for (FractalRegion region : regions) {
+            canvas.drawBitmap(region.getBitmap(), null, region.getBounds(), paint);
         }
         canvas.restore();
+
+        if (showPos) {
+            cur.invert(temp);
+            temp.postConcat(overall);
+            temp.getValues(mValues);
+            float posX = mValues[Matrix.MTRANS_X];
+            float posY = mValues[Matrix.MTRANS_Y];
+            float zoom = mValues[Matrix.MSCALE_X];
+            String s = String.format(POS_TEXT, posX, posY, zoom);
+            posPaint.getTextBounds(s, 0, s.length(), posRect);
+            canvas.drawText(s, posRect.width(),posRect.height(), posPaint);
+        }
     }
 
     @Override
     public boolean onTouchEvent(@NonNull MotionEvent event) {
+        showPos = false;
         boolean tf = gestureDetector.onTouchEvent(event);
         tf = tf || scaleGestureDetector.onTouchEvent(event);
         return tf || super.onTouchEvent(event);
@@ -367,14 +566,18 @@ public class FractalView extends View{
         }
     }
 
-    private void clampTranslate() {
+    private void _clamp(RectF dst) {
+        cur.mapRect(dst);
         cur.getValues(mValues);
-        mValues[Matrix.MTRANS_X] = mValues[Matrix.MTRANS_X] < maxX ?
-                mValues[Matrix.MTRANS_X] > minX ?
-                        mValues[Matrix.MTRANS_X] : minX : maxX;
-        mValues[Matrix.MTRANS_Y] = mValues[Matrix.MTRANS_Y] < maxY ?
-                mValues[Matrix.MTRANS_Y] > minY ?
-                        mValues[Matrix.MTRANS_Y] : minY : maxY;
-        cur.setValues(mValues);
+        final float ax = dst.left > bounds.left ? bounds.left - dst.left :
+                dst.right < bounds.right ? bounds.right - dst.right : 0.0f;
+        final float ay = dst.top > bounds.top ? bounds.top - dst.top :
+                dst.bottom < bounds.bottom ? bounds.bottom - dst.bottom : 0.0f;
+        cur.postTranslate(ax, ay);
+    }
+
+    private void _clamp() {
+        RectF dst = new RectF(content);
+        _clamp(dst);
     }
 }
